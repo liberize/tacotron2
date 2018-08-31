@@ -20,8 +20,12 @@ class LocationLayer(nn.Module):
                                          bias=False, w_init_gain='tanh')
 
     def forward(self, attention_weights_cat):
+        # attention_weights_cat shape: (batch, 2, max_time)
+        # processed_attention shape: (batch, n_filters, max_time)
         processed_attention = self.location_conv(attention_weights_cat)
+        # processed_attention shape: (batch, max_time, n_filters)
         processed_attention = processed_attention.transpose(1, 2)
+        # processed_attention shape: (batch, max_time, attention_dim)
         processed_attention = self.location_dense(processed_attention)
         return processed_attention
 
@@ -46,19 +50,23 @@ class Attention(nn.Module):
         PARAMS
         ------
         query: decoder output (batch, n_mel_channels * n_frames_per_step)
-        processed_memory: processed encoder outputs (B, T_in, attention_dim)
-        attention_weights_cat: cumulative and prev. att weights (B, 2, max_time)
+        processed_memory: processed encoder outputs (batch, T_in, attention_dim), T_in should be max_time ?
+        attention_weights_cat: cumulative and prev. att weights (batch, 2, max_time)
 
         RETURNS
         -------
         alignment (batch, max_time)
         """
 
+        # processed_query shape: (batch, 1, attention_dim)
         processed_query = self.query_layer(query.unsqueeze(1))
+        # processed_attention_weights shape: (batch, max_time, attention_dim)
         processed_attention_weights = self.location_layer(attention_weights_cat)
+        # energies shape: (batch, max_time, 1)
         energies = self.v(F.tanh(
             processed_query + processed_attention_weights + processed_memory))
 
+        # energies shape: (batch, max_time)
         energies = energies.squeeze(-1)
         return energies
 
@@ -68,8 +76,8 @@ class Attention(nn.Module):
         PARAMS
         ------
         attention_hidden_state: attention rnn last output
-        memory: encoder outputs
-        processed_memory: processed encoder outputs
+        memory: encoder outputs, (batch, max_time, embedding_dim)
+        processed_memory: processed encoder outputs, (batch, max_time, attention_dim)
         attention_weights_cat: previous and cummulative attention weights
         mask: binary mask for padded data
         """
@@ -173,29 +181,39 @@ class Encoder(nn.Module):
                             int(hparams.encoder_embedding_dim / 2), 1,
                             batch_first=True, bidirectional=True)
 
+    # train
     def forward(self, x, input_lengths):
+        # x shape: (batch, embedding_dim, padded_seq_len)
+        # input_lengths: original seq len without padding
         for conv in self.convolutions:
             x = self.dropout(F.relu(conv(x)))
 
+        # x shape: (batch, padded_seq_len, embedding_dim)
         x = x.transpose(1, 2)
 
         # pytorch tensor are not reversible, hence the conversion
         input_lengths = input_lengths.cpu().numpy()
+        # x shape: (packed_seq_len, embedding_dim)
+        # packed_seq_len equals to reduce_sum(input_lengths)
         x = nn.utils.rnn.pack_padded_sequence(
             x, input_lengths, batch_first=True)
 
         self.lstm.flatten_parameters()
         outputs, _ = self.lstm(x)
 
+        # outputs shape: (batch, padded_seq_len, embedding_dim)
         outputs, _ = nn.utils.rnn.pad_packed_sequence(
             outputs, batch_first=True)
 
         return outputs
 
+    # predict
     def inference(self, x):
+        # x shape: (embedding_dim, seq len)
         for conv in self.convolutions:
             x = self.dropout(F.relu(conv(x)))
 
+        # x shape: (seq len, embedding_dim)
         x = x.transpose(1, 2)
 
         self.lstm.flatten_parameters()
@@ -237,6 +255,7 @@ class Decoder(nn.Module):
             hparams.decoder_rnn_dim + hparams.encoder_embedding_dim,
             hparams.n_mel_channels*hparams.n_frames_per_step)
 
+        # stop token
         self.gate_layer = LinearNorm(
             hparams.decoder_rnn_dim + hparams.encoder_embedding_dim, 1,
             bias=True, w_init_gain='sigmoid')
@@ -300,12 +319,12 @@ class Decoder(nn.Module):
         inputs: processed decoder inputs
 
         """
-        # (B, n_mel_channels, T_out) -> (B, T_out, n_mel_channels)
+        # (batch, n_mel_channels, n_frames) -> (batch, n_frames, n_mel_channels)
         decoder_inputs = decoder_inputs.transpose(1, 2)
         decoder_inputs = decoder_inputs.view(
             decoder_inputs.size(0),
             int(decoder_inputs.size(1)/self.n_frames_per_step), -1)
-        # (B, T_out, n_mel_channels) -> (T_out, B, n_mel_channels)
+        # (batch, T_out, n_mel_channels * n_frames_per_step) -> (T_out, batch, n_mel_channels * n_frames_per_step)
         decoder_inputs = decoder_inputs.transpose(0, 1)
         return decoder_inputs
 
@@ -323,17 +342,17 @@ class Decoder(nn.Module):
         gate_outpust: gate output energies
         alignments:
         """
-        # (T_out, B) -> (B, T_out)
+        # (T_out, batch) -> (batch, T_out)
         alignments = torch.stack(alignments).transpose(0, 1)
-        # (T_out, B) -> (B, T_out)
+        # (T_out, batch) -> (batch, T_out)
         gate_outputs = torch.stack(gate_outputs).transpose(0, 1)
         gate_outputs = gate_outputs.contiguous()
-        # (T_out, B, n_mel_channels) -> (B, T_out, n_mel_channels)
+        # (T_out, batch, n_mel_channels * n_frames_per_step) -> (batch, T_out, n_mel_channels * n_frames_per_step)
         mel_outputs = torch.stack(mel_outputs).transpose(0, 1).contiguous()
         # decouple frames per step
         mel_outputs = mel_outputs.view(
             mel_outputs.size(0), -1, self.n_mel_channels)
-        # (B, T_out, n_mel_channels) -> (B, n_mel_channels, T_out)
+        # (batch, n_frames, n_mel_channels) -> (batch, n_mel_channels, n_frames)
         mel_outputs = mel_outputs.transpose(1, 2)
 
         return mel_outputs, gate_outputs, alignments
